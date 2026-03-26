@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import numpy as np
 from scipy import stats
 from statsmodels.nonparametric.smoothers_lowess import lowess
+from scipy.interpolate import griddata
 
 import xml.etree.ElementTree as ET
 
@@ -514,6 +515,129 @@ def make_radius_thickness_by_condition_plots(y_range=None, show_trend_legend=Tru
         fig.update_layout(yaxis=dict(range=y_range))
     
     return dcc.Graph(figure=fig)
+
+def make_wafer_contour_plot(wafer_id, filtered_df=None):
+    """Create a contour plot for Layer 1 Thickness using x_wafer_loc and y_wafer_loc for a specific wafer"""
+    working_df = filtered_df if filtered_df is not None else df
+    
+    if wafer_id is None:
+        return html.Div("Please select a wafer to display contour plot")
+    
+    # Filter for the selected wafer and Layer 1 Thickness data
+    wafer_thickness_data = working_df[
+        (working_df['WaferID'] == wafer_id) & 
+        (working_df['Label'] == 'Layer 1 Thickness') &
+        (working_df['XWaferLoc'].notna()) &
+        (working_df['YWaferLoc'].notna())
+    ].copy()
+    
+    if wafer_thickness_data.empty:
+        return html.Div(f"No Layer 1 Thickness data with coordinates found for WaferID: {wafer_id}")
+    
+    # Convert coordinates to numeric
+    try:
+        wafer_thickness_data.loc[:, 'X'] = pd.to_numeric(wafer_thickness_data['XWaferLoc'])
+        wafer_thickness_data.loc[:, 'Y'] = pd.to_numeric(wafer_thickness_data['YWaferLoc'])
+        wafer_thickness_data.loc[:, 'Z'] = pd.to_numeric(wafer_thickness_data['Datum'])
+    except (ValueError, TypeError):
+        return html.Div(f"Error converting coordinate data to numeric for WaferID: {wafer_id}")
+    
+    # Remove any rows with invalid coordinates
+    wafer_thickness_data = wafer_thickness_data.dropna(subset=['X', 'Y', 'Z'])
+    
+    if wafer_thickness_data.empty:
+        return html.Div(f"No valid coordinate data found for WaferID: {wafer_id}")
+    
+    # Get unique coordinates and values
+    x = wafer_thickness_data['X'].values
+    y = wafer_thickness_data['Y'].values
+    z = wafer_thickness_data['Z'].values
+    
+    # Create a grid for interpolation
+    xi = np.linspace(-150, 150, 100)
+    yi = np.linspace(-150, 150, 100)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+    
+    try:
+        # Interpolate data onto grid using griddata
+        zi = griddata((x, y), z, (xi_grid, yi_grid), method='linear')
+        
+        # Create the contour plot
+        fig = go.Figure()
+        
+        # Add contour plot
+        contour = go.Contour(
+            x=xi,
+            y=yi,
+            z=zi,
+            colorscale='Viridis',
+            colorbar=dict(title="Layer 1 Thickness"),
+            contours=dict(
+                start=np.nanmin(zi),
+                end=np.nanmax(zi),
+                size=(np.nanmax(zi) - np.nanmin(zi)) / 20
+            )
+        )
+        fig.add_trace(contour)
+        
+        # Add scatter points to show actual measurement locations
+        scatter = go.Scatter(
+            x=x,
+            y=y,
+            mode='markers',
+            marker=dict(
+                size=6,
+                color=z,
+                colorscale='Viridis',
+                line=dict(width=1, color='black'),
+                showscale=False
+            ),
+            text=[f'X: {xi:.1f}<br>Y: {yi:.1f}<br>Thickness: {zi:.2f}' 
+                  for xi, yi, zi in zip(x, y, z)],
+            hovertemplate='%{text}<extra></extra>',
+            name='Measurement Points'
+        )
+        fig.add_trace(scatter)
+        
+        # Update layout
+        fig.update_layout(
+            title=f'Layer 1 Thickness Contour Plot - WaferID: {wafer_id}',
+            xaxis_title='X Wafer Location (mm)',
+            yaxis_title='Y Wafer Location (mm)',
+            xaxis=dict(
+                range=[-150, 150],
+                dtick=30,
+                scaleanchor="y",
+                scaleratio=1
+            ),
+            yaxis=dict(
+                range=[-150, 150],
+                dtick=30
+            ),
+            height=600,
+            width=600,
+            margin=dict(l=50, r=50, t=50, b=50)
+        )
+        
+        # Add circle outlines to show wafer boundary (assuming 150mm radius wafer)
+        circle_angles = np.linspace(0, 2*np.pi, 100)
+        circle_x = 150 * np.cos(circle_angles)
+        circle_y = 150 * np.sin(circle_angles)
+        
+        fig.add_trace(go.Scatter(
+            x=circle_x,
+            y=circle_y,
+            mode='lines',
+            line=dict(color='black', width=2, dash='dash'),
+            name='Wafer Boundary (150mm)',
+            showlegend=True,
+            hoverinfo='skip'
+        ))
+        
+        return dcc.Graph(figure=fig)
+        
+    except Exception as e:
+        return html.Div(f"Error creating contour plot: {str(e)}")
 
 def make_files_table():
     """Create a table showing all processed XML files"""
@@ -1637,6 +1761,40 @@ def make_condition_std_dev_plot(filtered_df=None):
     
     return dcc.Graph(figure=fig)
 
+# Callback to populate wafer dropdown options
+@app.callback(
+    Output('contour-wafer-dropdown', 'options'),
+    [Input('outlier-method-dropdown', 'value'),
+     Input('outlier-threshold-input', 'value'),
+     Input('condition-filter-input', 'value')]
+)
+def update_wafer_dropdown_options(outlier_method, outlier_threshold, condition_filter):
+    filtered_df = get_filtered_dataframe(outlier_method, outlier_threshold, condition_filter)
+    
+    # Get unique wafer IDs that have Layer 1 Thickness data with coordinates
+    wafer_thickness_data = filtered_df[
+        (filtered_df['Label'] == 'Layer 1 Thickness') &
+        (filtered_df['XWaferLoc'].notna()) &
+        (filtered_df['YWaferLoc'].notna())
+    ]
+    
+    unique_wafers = sorted(wafer_thickness_data['WaferID'].unique())
+    
+    options = [{'label': wafer_id, 'value': wafer_id} for wafer_id in unique_wafers]
+    return options
+
+# Callback to update contour plot based on selected wafer
+@app.callback(
+    Output('wafer-contour-plot', 'children'),
+    [Input('contour-wafer-dropdown', 'value'),
+     Input('outlier-method-dropdown', 'value'),
+     Input('outlier-threshold-input', 'value'),
+     Input('condition-filter-input', 'value')]
+)
+def update_wafer_contour_plot(selected_wafer, outlier_method, outlier_threshold, condition_filter):
+    filtered_df = get_filtered_dataframe(outlier_method, outlier_threshold, condition_filter)
+    return make_wafer_contour_plot(selected_wafer, filtered_df)
+
 app.layout = html.Div([
     html.H1("XML Data Analysis"),
     
@@ -1760,6 +1918,22 @@ app.layout = html.Div([
     # New section for standard deviation by condition
     html.H2("Standard Deviation of Layer 1 Thickness by Condition"),
     html.Div(id='condition-std-dev-plot'),
+    
+    html.Hr(),
+    
+    # Contour Plot Section
+    html.H2("Wafer Contour Plot - Layer 1 Thickness"),
+    html.Div([
+        html.Label("Select Wafer ID:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+        dcc.Dropdown(
+            id='contour-wafer-dropdown',
+            options=[],  # Will be populated by callback
+            value=None,
+            placeholder="Select a wafer to view contour plot",
+            style={'width': '300px', 'display': 'inline-block'}
+        )
+    ], style={'margin': '10px 0'}),
+    html.Div(id='wafer-contour-plot'),
     
     html.Hr(),
     
